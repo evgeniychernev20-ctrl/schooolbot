@@ -1,29 +1,86 @@
 import os
-from datetime import datetime, timedelta
+import sys
+import threading
+import logging
+from datetime import datetime
 from dotenv import load_dotenv
+from flask import Flask
 from pyrogram import Client, filters
 from pyrogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton, 
     CallbackQuery, ForceReply
 )
+from pyrogram.enums import ParseMode
 
 from database import Database
 
+# Загружаем переменные окружения
 load_dotenv()
 
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('bot.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# ===== Flask сервер для Render =====
+app_flask = Flask(__name__)
+
+@app_flask.route('/')
+def home():
+    return "🤖 Бот-расписание работает! Версия 1.0"
+
+@app_flask.route('/health')
+def health():
+    """Health check для Render и UptimeRobot"""
+    return "OK", 200
+
+@app_flask.route('/stats')
+def stats():
+    """Простая статистика"""
+    return {
+        'status': 'running',
+        'time': datetime.now().isoformat(),
+        'admins': len(db.get_admins()),
+        'homework': len(db.get_homework())
+    }
+
+def run_flask():
+    """Запускает Flask сервер в отдельном потоке"""
+    try:
+        port = int(os.environ.get('PORT', 8080))
+        logger.info(f"Flask сервер запускается на порту {port}")
+        app_flask.run(host='0.0.0.0', port=port)
+    except Exception as e:
+        logger.error(f"Ошибка Flask: {e}")
+
+# Запускаем Flask в фоне
+threading.Thread(target=run_flask, daemon=True).start()
+
+# ===== Pyrogram бот =====
 app = Client(
     "schedule_bot",
     api_id=int(os.getenv("API_ID")),
     api_hash=os.getenv("API_HASH"),
-    bot_token=os.getenv("BOT_TOKEN")
+    bot_token=os.getenv("BOT_TOKEN"),
+    workdir="./",
+    sleep_threshold=30
 )
 
 db = Database()
 
 # ID главного админа (твой Telegram ID)
-MAIN_ADMIN_ID = 123456789  # ЗАМЕНИ НА СВОЙ ID
+MAIN_ADMIN_ID = 123456789  # ЗАМЕНИ НА СВОЙ ID!
 
-# ===== ПРОВЕРКА ПРАВ =====
+# Дни недели для расписания
+DAYS = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+
+# ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====
 
 async def is_admin(user_id):
     """Проверяет, может ли пользователь управлять ботом"""
@@ -31,7 +88,24 @@ async def is_admin(user_id):
         return True
     return db.is_admin(user_id)
 
-# ===== ГЛАВНОЕ МЕНЮ В ЛС =====
+async def notify_group(client, text, keyboard=None):
+    """Отправляет уведомление в целевую группу"""
+    group = db.get_target_group()
+    if group:
+        try:
+            await client.send_message(
+                group['chat_id'],
+                text,
+                reply_markup=keyboard,
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка отправки в группу: {e}")
+            return False
+    return False
+
+# ===== КОМАНДЫ =====
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_command(client: Client, message: Message):
@@ -51,7 +125,7 @@ async def start_command(client: Client, message: Message):
         [InlineKeyboardButton("🔄 Добавить замену", callback_data="add_substitution")],
         [InlineKeyboardButton("📅 Добавить экзамен", callback_data="add_exam")],
         [InlineKeyboardButton("📋 Просмотреть всё", callback_data="view_all")],
-        [InlineKeyboardButton("⚙️ Настройки группы", callback_data="settings")]
+        [InlineKeyboardButton("⚙️ Настройки", callback_data="settings")]
     ])
     
     # Проверяем, настроена ли целевая группа
@@ -66,13 +140,12 @@ async def start_command(client: Client, message: Message):
         reply_markup=keyboard
     )
 
-# ===== НАСТРОЙКА ГРУППЫ =====
-
 @app.on_message(filters.command("setgroup") & filters.private)
 async def set_group_command(client: Client, message: Message):
     user_id = message.from_user.id
     
     if not await is_admin(user_id):
+        await message.reply_text("❌ Нет доступа")
         return
     
     parts = message.text.split(maxsplit=1)
@@ -96,7 +169,7 @@ async def set_group_command(client: Client, message: Message):
         # Отправляем тестовое сообщение в группу
         await client.send_message(
             chat.id,
-            f"✅ Бот настроен!\n"
+            f"✅ **Бот настроен!**\n"
             f"Теперь уведомления будут приходить сюда.\n"
             f"Администратор: {message.from_user.mention}"
         )
@@ -106,7 +179,7 @@ async def set_group_command(client: Client, message: Message):
     except Exception as e:
         await message.reply_text(f"❌ Ошибка: {e}\n\nУбедись, что бот добавлен в группу!")
 
-# ===== ДОБАВЛЕНИЕ ДЗ (через диалог) =====
+# ===== ДОБАВЛЕНИЕ ДЗ =====
 
 @app.on_callback_query(filters.regex("^add_homework$"))
 async def add_homework_callback(client: Client, callback_query: CallbackQuery):
@@ -124,8 +197,6 @@ async def add_homework_callback(client: Client, callback_query: CallbackQuery):
         reply_markup=ForceReply(selective=True)
     )
     
-    # Сохраняем состояние (ждем ответ)
-    # В Pyrogram можно использовать filters.reply
     await callback_query.answer()
 
 @app.on_message(filters.private & filters.reply & filters.text)
@@ -152,18 +223,17 @@ async def handle_homework_input(client: Client, message: Message):
     hw_id = db.add_homework(lesson, task, deadline, message.from_user.id)
     
     # Отправляем в группу
-    group = db.get_target_group()
-    if group:
-        deadline_text = f" (до {deadline})" if deadline else ""
-        
-        await client.send_message(
-            group['chat_id'],
-            f"📚 **Новое домашнее задание!**\n\n"
-            f"**Предмет:** {lesson}\n"
-            f"**Задание:** {task}{deadline_text}\n"
-            f"👤 Добавил: {message.from_user.first_name}"
-        )
-        
+    deadline_text = f" (до {deadline})" if deadline else ""
+    notification = (
+        f"📚 **Новое домашнее задание!**\n\n"
+        f"**Предмет:** {lesson}\n"
+        f"**Задание:** {task}{deadline_text}\n"
+        f"👤 Добавил: {message.from_user.first_name}"
+    )
+    
+    sent = await notify_group(client, notification)
+    
+    if sent:
         await message.reply_text("✅ ДЗ добавлено и отправлено в группу!")
     else:
         await message.reply_text("✅ ДЗ сохранено, но группа не настроена. Используй /setgroup")
@@ -203,7 +273,12 @@ async def handle_substitution_input(client: Client, message: Message):
         return
     
     date = parts[0]
-    lesson_num = int(parts[1])
+    try:
+        lesson_num = int(parts[1])
+    except:
+        await message.reply_text("❌ Номер пары должен быть числом")
+        return
+    
     lesson = parts[2]
     teacher = parts[3] if len(parts) > 3 else ""
     room = parts[4] if len(parts) > 4 else ""
@@ -213,23 +288,86 @@ async def handle_substitution_input(client: Client, message: Message):
     sub_id = db.add_substitution(date, lesson_num, lesson, teacher, room, comment, message.from_user.id)
     
     # Отправляем в группу
-    group = db.get_target_group()
-    if group:
-        date_formatted = datetime.strptime(date, "%Y-%m-%d").strftime("%d.%m.%Y")
-        teacher_text = f", {teacher}" if teacher else ""
-        room_text = f", каб. {room}" if room else ""
-        comment_text = f"\n💬 {comment}" if comment else ""
-        
-        await client.send_message(
-            group['chat_id'],
-            f"🔄 **Замена на {date_formatted}!**\n\n"
-            f"**{lesson_num}-я пара:** {lesson}{teacher_text}{room_text}{comment_text}\n"
-            f"👤 Добавил: {message.from_user.first_name}"
-        )
-        
+    date_formatted = datetime.strptime(date, "%Y-%m-%d").strftime("%d.%m.%Y")
+    teacher_text = f", {teacher}" if teacher else ""
+    room_text = f", каб. {room}" if room else ""
+    comment_text = f"\n💬 {comment}" if comment else ""
+    
+    notification = (
+        f"🔄 **Замена на {date_formatted}!**\n\n"
+        f"**{lesson_num}-я пара:** {lesson}{teacher_text}{room_text}{comment_text}\n"
+        f"👤 Добавил: {message.from_user.first_name}"
+    )
+    
+    sent = await notify_group(client, notification)
+    
+    if sent:
         await message.reply_text("✅ Замена добавлена и отправлена в группу!")
     else:
         await message.reply_text("✅ Замена сохранена")
+
+# ===== ДОБАВЛЕНИЕ ЭКЗАМЕНА =====
+
+@app.on_callback_query(filters.regex("^add_exam$"))
+async def add_exam_callback(client: Client, callback_query: CallbackQuery):
+    if not await is_admin(callback_query.from_user.id):
+        return
+    
+    await callback_query.message.reply_text(
+        "📅 **Добавление экзамена**\n\n"
+        "Отправь сообщение в формате:\n"
+        "`Предмет | Дата | Время | Аудитория | Описание`\n\n"
+        "Пример:\n"
+        "`Математика | 2026-06-10 | 10:00 | 301 | Экзамен`\n\n"
+        "Время, аудиторию и описание можно не указывать.",
+        reply_markup=ForceReply(selective=True)
+    )
+    
+    await callback_query.answer()
+
+@app.on_message(filters.private & filters.reply & filters.text)
+async def handle_exam_input(client: Client, message: Message):
+    if not await is_admin(message.from_user.id):
+        return
+    
+    if not message.reply_to_message or "Добавление экзамена" not in message.reply_to_message.text:
+        return
+    
+    text = message.text.strip()
+    parts = [p.strip() for p in text.split("|")]
+    
+    if len(parts) < 2:
+        await message.reply_text("❌ Неверный формат. Нужно минимум: Предмет | Дата")
+        return
+    
+    lesson = parts[0]
+    date = parts[1]
+    time = parts[2] if len(parts) > 2 else ""
+    room = parts[3] if len(parts) > 3 else ""
+    description = parts[4] if len(parts) > 4 else ""
+    
+    # Сохраняем в БД
+    exam_id = db.add_exam(lesson, date, time, room, description, message.from_user.id)
+    
+    # Отправляем в группу
+    date_formatted = datetime.strptime(date, "%Y-%m-%d").strftime("%d.%m.%Y")
+    time_text = f" в {time}" if time else ""
+    room_text = f", ауд. {room}" if room else ""
+    desc_text = f"\n📌 {description}" if description else ""
+    
+    notification = (
+        f"📅 **Добавлен экзамен!**\n\n"
+        f"**Предмет:** {lesson}\n"
+        f"**Дата:** {date_formatted}{time_text}{room_text}{desc_text}\n"
+        f"👤 Добавил: {message.from_user.first_name}"
+    )
+    
+    sent = await notify_group(client, notification)
+    
+    if sent:
+        await message.reply_text("✅ Экзамен добавлен и отправлен в группу!")
+    else:
+        await message.reply_text("✅ Экзамен сохранен")
 
 # ===== ПРОСМОТР ВСЕГО =====
 
@@ -303,6 +441,93 @@ async def view_today_subs_callback(client: Client, callback_query: CallbackQuery
         ]])
     )
 
+@app.on_callback_query(filters.regex("^view_exams$"))
+async def view_exams_callback(client: Client, callback_query: CallbackQuery):
+    exams = db.get_exams()
+    
+    if not exams:
+        await callback_query.message.edit_text(
+            "📅 Нет предстоящих экзаменов.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Назад", callback_data="view_all")
+            ]])
+        )
+        return
+    
+    text = "📅 **Предстоящие экзамены:**\n\n"
+    for exam in exams:
+        date_formatted = datetime.strptime(exam['date'], "%Y-%m-%d").strftime("%d.%m.%Y")
+        time_text = f" в {exam['time']}" if exam['time'] else ""
+        room_text = f", ауд. {exam['room']}" if exam['room'] else ""
+        desc_text = f"\n  {exam['description']}" if exam['description'] else ""
+        text += f"• **{exam['lesson']}** — {date_formatted}{time_text}{room_text}{desc_text}\n\n"
+    
+    await callback_query.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔙 Назад", callback_data="view_all")
+        ]])
+    )
+
+# ===== НАСТРОЙКИ =====
+
+@app.on_callback_query(filters.regex("^settings$"))
+async def settings_callback(client: Client, callback_query: CallbackQuery):
+    if not await is_admin(callback_query.from_user.id):
+        return
+    
+    group = db.get_target_group()
+    admins = db.get_admins()
+    
+    text = "⚙️ **Настройки**\n\n"
+    text += f"**Группа:** {group['chat_title'] if group else 'Не настроена'}\n"
+    text += f"**Администраторов:** {len(admins)}\n"
+    
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("👥 Управление админами", callback_data="manage_admins")],
+        [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")]
+    ])
+    
+    await callback_query.message.edit_text(text, reply_markup=keyboard)
+
+@app.on_callback_query(filters.regex("^manage_admins$"))
+async def manage_admins_callback(client: Client, callback_query: CallbackQuery):
+    if callback_query.from_user.id != MAIN_ADMIN_ID:
+        await callback_query.answer("Только главный админ может управлять админами")
+        return
+    
+    admins = db.get_admins()
+    
+    text = "👥 **Список администраторов:**\n\n"
+    keyboard = []
+    
+    for admin in admins:
+        text += f"• {admin['first_name']} (@{admin['username']}) - `{admin['user_id']}`\n"
+        if admin['user_id'] != MAIN_ADMIN_ID:
+            keyboard.append([InlineKeyboardButton(
+                f"❌ Удалить {admin['first_name']}", 
+                callback_data=f"remove_admin_{admin['user_id']}"
+            )])
+    
+    text += "\nЧтобы добавить админа, используй команду:\n`/addadmin USER_ID`"
+    
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="settings")])
+    
+    await callback_query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+@app.on_callback_query(filters.regex(r"^remove_admin_(\d+)$"))
+async def remove_admin_callback(client: Client, callback_query: CallbackQuery):
+    if callback_query.from_user.id != MAIN_ADMIN_ID:
+        await callback_query.answer("Только главный админ может удалять админов")
+        return
+    
+    user_id = int(callback_query.data.split("_")[2])
+    db.remove_admin(user_id)
+    
+    await callback_query.answer("Админ удален")
+    await manage_admins_callback(client, callback_query)
+
 # ===== ДОБАВЛЕНИЕ АДМИНОВ =====
 
 @app.on_message(filters.command("addadmin") & filters.private)
@@ -368,6 +593,32 @@ async def list_admins_command(client: Client, message: Message):
     
     await message.reply_text(text)
 
+# ===== СТАТИСТИКА =====
+
+@app.on_callback_query(filters.regex("^stats$"))
+async def stats_callback(client: Client, callback_query: CallbackQuery):
+    homework = db.get_homework()
+    subs = db.get_substitutions()
+    exams = db.get_exams()
+    admins = db.get_admins()
+    
+    text = "📊 **Статистика бота**\n\n"
+    text += f"📚 Домашних заданий: {len(homework)}\n"
+    text += f"🔄 Замен: {len(subs)}\n"
+    text += f"📅 Экзаменов: {len(exams)}\n"
+    text += f"👥 Администраторов: {len(admins)}\n"
+    
+    if group := db.get_target_group():
+        text += f"\n✅ Группа: {group['chat_title']}"
+    else:
+        text += f"\n❌ Группа не настроена"
+    
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔙 Назад", callback_data="settings")
+    ]])
+    
+    await callback_query.message.edit_text(text, reply_markup=keyboard)
+
 # ===== КНОПКА НАЗАД =====
 
 @app.on_callback_query(filters.regex("^back_to_main$"))
@@ -378,10 +629,24 @@ async def back_to_main_callback(client: Client, callback_query: CallbackQuery):
 
 if __name__ == "__main__":
     print("=" * 50)
-    print("📚 ЗАПУСК БОТА-РАСПИСАНИЯ (УПРАВЛЕНИЕ ИЗ ЛС)")
+    print("📚 ЗАПУСК БОТА-РАСПИСАНИЯ")
     print("=" * 50)
-    print("\n✅ Бот готов к работе!")
-    print("📱 Админы управляют в личном чате с ботом")
-    print("👥 Участники получают уведомления в группе")
     
-    app.run()
+    # Проверяем наличие необходимых переменных
+    required_vars = ["API_ID", "API_HASH", "BOT_TOKEN"]
+    missing = [var for var in required_vars if not os.getenv(var)]
+    
+    if missing:
+        print(f"❌ Ошибка: отсутствуют переменные: {', '.join(missing)}")
+        print("Создай файл .env с токенами или добавь их в переменные окружения")
+        sys.exit(1)
+    
+    print(f"✅ Главный админ ID: {MAIN_ADMIN_ID}")
+    print("✅ Flask сервер запущен")
+    print("🚀 Запуск Telegram бота...")
+    
+    try:
+        app.run()
+    except Exception as e:
+        logger.error(f"Критическая ошиб
+
