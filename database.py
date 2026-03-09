@@ -77,6 +77,19 @@ class Database:
                 )
             ''')
             
+            # Предложения от участников (если добавишь позже)
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS suggestions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    username TEXT,
+                    type TEXT,
+                    data TEXT,
+                    status TEXT DEFAULT 'pending',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
             self.conn.commit()
     
     # ===== НАСТРОЙКА ГРУППЫ =====
@@ -149,6 +162,11 @@ class Database:
             ''', (future.isoformat(),))
             return [dict(row) for row in self.cursor.fetchall()]
     
+    def delete_homework(self, hw_id):
+        with self.lock:
+            self.cursor.execute('DELETE FROM homework WHERE id = ?', (hw_id,))
+            self.conn.commit()
+    
     # ===== ЗАМЕНЫ =====
     
     def add_substitution(self, date, lesson_number, lesson, teacher, room, comment, added_by):
@@ -160,14 +178,23 @@ class Database:
             self.conn.commit()
             return self.cursor.lastrowid
     
-    def get_substitutions(self, date):
+    def get_substitutions(self, date=None):
         with self.lock:
-            self.cursor.execute('''
-                SELECT lesson_number, lesson, teacher, room, comment
-                FROM substitutions
-                WHERE date = ?
-                ORDER BY lesson_number
-            ''', (date,))
+            if date:
+                self.cursor.execute('''
+                    SELECT lesson_number, lesson, teacher, room, comment
+                    FROM substitutions
+                    WHERE date = ?
+                    ORDER BY lesson_number
+                ''', (date,))
+            else:
+                today = datetime.now().strftime("%Y-%m-%d")
+                self.cursor.execute('''
+                    SELECT date, lesson_number, lesson, teacher, room, comment
+                    FROM substitutions
+                    WHERE date >= ?
+                    ORDER BY date, lesson_number
+                ''', (today,))
             return [dict(row) for row in self.cursor.fetchall()]
     
     # ===== ЭКЗАМЕНЫ =====
@@ -183,9 +210,11 @@ class Database:
     
     def get_exams(self):
         with self.lock:
+            today = datetime.now().strftime("%Y-%m-%d")
             self.cursor.execute('''
                 SELECT lesson, date, time, room, description
                 FROM exams
+                WHERE date >= ?
                 ORDER BY date
-            ''')
+            ''', (today,))
             return [dict(row) for row in self.cursor.fetchall()]
